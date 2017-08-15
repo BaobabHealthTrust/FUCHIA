@@ -1,0 +1,1036 @@
+require 'fastercsv'
+require 'script/FUCHIA/utilities.rb'
+require 'script/FUCHIA/data_cleaner.rb'
+
+User.current = User.find_by_username('admin')
+ScriptStared = Time.now()
+Utils = Utilities.new
+Cleaner = DataCleaner.new
+set_up = File.read('config/setup_params.json')
+set_up_data = JSON.parse(set_up)
+site_name = set_up_data['site_name'].split(" ")[0].downcase
+
+Hiv_reception_encounter = EncounterType.find_by_name("Hiv reception")
+Vitals = EncounterType.find_by_name("Vitals")
+HIV_staging = EncounterType.find_by_name("HIV staging")
+Treatment = EncounterType.find_by_name("TREATMENT")
+Dispension = EncounterType.find_by_name("DISPENSING")
+Encounter_id = Encounter.last
+Order_id = Order.last
+Appointment = EncounterType.find_by_name("APPOINTMENT")
+HIV_clinic_consultation = EncounterType.find_by_name("HIV CLINIC CONSULTATION")
+Source_path = set_up_data['source_path'] #/home/pachawo/Documents/msf/msf_data/namitambo
+Destination_path = "#{File.expand_path('~')}/msf_#{site_name}/" #'/home/pachawo/Documents/msf/msf_data/namitambo/'
+
+$db = YAML::load_file('config/database.yml')
+$db_user = $db['development']['username']
+$source_db = $db['development']['database']
+$db_pass = $db['development']['password']
+$db_host = $db['development']['host']
+
+@@p_ids = YAML::load_file("#{Destination_path}p_id.yml")
+
+@@initial_who_stage = {}
+
+@@staging_conditions = []
+
+@@patient_visits = {}
+
+@@drug_map = {}
+
+@@drug_follow_up = Utils.drug_mapping
+
+@@patient_tb_details = {}
+
+@@patient_diagnosis = {}
+
+@@references = Utils.set_references
+
+file_path = "#{Rails.root}/app/assets/data/errors/error.txt"
+
+if !File.exists?(file_path)
+  file = File.new(file_path, 'w')
+end
+
+
+
+def start
+
+  obs =  "INSERT INTO obs (person_id, encounter_id, concept_id, value_numeric,value_coded,"
+  obs += "value_datetime,value_drug, order_id, obs_datetime, creator, date_created, uuid) VALUES "
+
+  encounter =  "INSERT INTO encounter (encounter_id, encounter_type, patient_id, provider_id,"
+  encounter += "encounter_datetime, creator, date_created, uuid) VALUES "
+
+  order =   "INSERT INTO orders (order_id, order_type_id, orderer, concept_id, encounter_id, "
+  order +=  "start_date, auto_expire_date,discontinued, creator, date_created, patient_id, uuid) VALUES "
+
+  drug_order =  "INSERT INTO drug_order (order_id, drug_inventory_id, dose, "
+  drug_order +=  "equivalent_daily_dose, units, frequency, quantity) VALUES "
+
+  `cd #{Destination_path} && [ -f encounters.sql ] && rm encounters.sql && [ -f observations.sql ] && rm observations.sql && [ -f orders.sql ] && rm orders.sql && [ -f drug_orders.sql ] && rm drug_orders.sql`
+
+  `touch encounters.sql observations.sql orders.sql drug_orders.sql`
+
+  `echo -n '#{encounter}' >> #{Destination_path}encounters.sql`
+  `echo -n '#{obs}' >> #{Destination_path}observations.sql`
+  `echo -n '#{order}' >> #{Destination_path}orders.sql`
+  `echo -n '#{drug_order}' >> #{Destination_path}drug_orders.sql`
+
+  if Encounter_id.blank?
+    encounter_id = 1
+  else
+    encounter_id = Encounter_id.id + 1
+  end
+
+  if Order_id.blank?
+    order_id = 1
+  else
+    order_id = Order_id.id.to_i + 1
+  end
+
+
+
+  FasterCSV.foreach("#{Source_path}tb_follow_up.csv", :headers => true, :quote_char => '"', :col_sep => ',', :row_sep => :auto) do |row|
+
+    reference = row['FdxReferencePatient']
+
+    patient_id = @@p_ids[reference]
+
+    puts "#{patient_id}"
+
+    next if Patient.find_by_patient_id(patient_id).blank? 
+
+    date_created = Utils.format_date(row[1]).to_date rescue nil
+
+    date_created = date_created.blank? ? "NULL" : date_created.strftime("%Y-%m-%d 00:00:00")
+
+    visit_date = Utils.format_date(row[9]).to_date rescue nil
+
+    next_visit = Utils.format_date(row[10]).to_date rescue nil
+
+    who = @@initial_who_stage[reference] rescue nil
+
+    amenorhea = row['FdnAmenorhea']
+
+    tb_last_2_years = row['FdsVar1']
+
+    person = Person.find_by_person_id(patient_id)
+
+    age = person['date_created'].year - person['birthdate'].year
+
+    ref_id = row[0].to_i
+
+    next if visit_date.blank? || patient_id.blank?
+
+    start_date = visit_date.strftime("%Y-%m-%d 00:00:00")
+
+    end_date = visit_date.strftime("%Y-%m-%d 23:59:59")
+
+    begin
+
+      patient = Patient.find(patient_id)
+
+    rescue
+
+      ############## code to log errors ########
+
+      next
+
+    end
+
+    encounter = Encounter.find(:all, :conditions => ["patient_id = ? and encounter_datetime
+     between ? and ? and encounter_type = ?",patient_id, start_date, end_date,
+                                                     Hiv_reception_encounter.id])
+
+    if encounter.blank?
+
+      puts ">>>#{encounter_id} ############# HIV Clinic reception for #{patient_id}"
+
+      self.create_hiv_reception(encounter_id, patient_id, visit_date, date_created)
+
+      encounter_id = encounter_id.to_i + 1
+
+    else
+
+      puts "Patient has encounters recorded!!"
+
+    end
+
+    ###########################################################################################
+
+    #>>>>>>>>>>>> estimate patient's weight during visit in case weight is not available <<<<<<<<<<#
+
+    weight_during_visit = PatientService.get_patient_attribute_value(patient, "current_weight", visit_date)
+
+    age_during_visit = (visit_date.year - patient.person.birthdate.year).to_i
+
+    if weight_during_visit.blank?
+
+      if age > 18
+
+        weight_during_visit = 50.0
+
+      elsif age >= 14 and age <= 18
+
+        weight_during_visit = 35.0
+
+      elsif age >= 10 and age < 14
+
+        weight_during_visit = 20.0
+
+      elsif age >= 5 and age < 10
+
+        weight_during_visit = 15.0
+
+      else
+
+        weight_during_visit = 5.0
+
+      end
+
+    end
+
+    #>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>><<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<<#
+
+    ############################### creating vitals ###########################################
+
+    weight = row[28].to_f rescue nil
+
+    height = row[29].to_f rescue nil
+
+    vitals_encounter = nil
+
+
+    puts ">>>#{encounter_id} ############# Vitals for #{patient_id}"
+
+    unless row[28].blank?
+
+      vitals_encounter = self.create_encounter(encounter_id, patient_id, Vitals.id, visit_date, date_created)
+
+      self.create_observation_value_numeric(vitals_encounter, "Weight (kg)", weight)
+
+      encounter_id = encounter_id.to_i + 1
+
+      vital_enc_incremented = true if !vitals_encounter.blank?
+
+    end
+
+    unless row[29].blank?
+
+      vitals_encounter = self.create_encounter(encounter_id, patient_id, Vitals.id, visit_date, date_created) if vitals_encounter.blank?
+
+      self.create_observation_value_numeric(vitals_encounter, "Height (cm)", height)
+
+      encounter_id = encounter_id.to_i + 1 if !vital_enc_incremented
+
+    end
+
+    if !row[28].blank? && !row[29].blank?
+
+      bmi = (weight.to_f / (height.to_f * height.to_f)) * 10000
+
+      self.create_observation_value_numeric(vitals_encounter, "BMI", bmi)
+
+    end
+
+    ###########################################################################################
+
+    diagnostic = row[30] rescue nil
+
+    diagnostic_2 = row[31] rescue nil
+
+    cd4_count = row[23].to_i
+
+    date_cd4_count = Utils.format_date(row[14]).to_date unless row[14].blank?
+
+    ############################ hiv staging and clinical consultation #########################
+
+    s_c = @@patient_visits[patient_id] rescue []
+
+    puts ">>>#{encounter_id} ############# HIV Staging for #{patient_id}"
+
+
+    hiv_staging_encounter = Encounter.find(:last, :conditions => ["patient_id = ?
+    and encounter_type = ?",patient_id, HIV_staging.id])
+
+    puts hiv_staging_encounter.inspect
+
+    if hiv_staging_encounter.blank?
+
+      hiv_staging_encounter = Encounter.new
+      hiv_staging_encounter.encounter_id = "#{encounter_id}"
+      hiv_staging_encounter.encounter_type = HIV_STAGING.id
+      hiv_staging_encounter.patient_id = patient_id
+      hiv_staging_encounter.encounter_datetime = visit_date
+      hiv_staging_encounter.date_created = date_created
+      hiv_staging_encounter.save
+
+      encounter_id = encounter_id + 1
+
+    end
+
+      #hiv_staging_encounter = self.create_encounter(encounter_id, patient_id, HIV_staging.id, visit_date, date_created) if hiv_staging_encounter.blank?
+
+      if !s_c.blank?
+
+        (s_c || []).each do |cond|
+
+
+          begin
+            self.create_observation_value_coded(hiv_staging_encounter, "Who stages criteria present", cond)
+          rescue
+            File.open("#{Rails.root}/app/assets/data/errors/error.txt", 'a') do |f|
+              f.puts "#{cond} \n"
+            end
+            puts ".>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>>#{cond}"
+          end
+        end
+
+      end
+
+      who_stage = Utils.get_patient_who_stage(who,age)
+
+      self.create_observation_value_coded(hiv_staging_encounter, "WHO stage", who_stage) unless who_stage.blank?
+
+
+      #encounter_id = encounter_id + 1
+
+=begin
+  if diagnostic_2.match(/preg/i) || diagnostic.match(/preg/i)
+    self.create_observation_value_coded(hiv_staging_encounter, 'Pregnant', 'Yes')
+  end rescue nil
+=end
+
+    if !cd4_count.blank? && !date_cd4_count.blank?
+
+      self.create_observation_value_numeric(hiv_staging_encounter, 'CD4 count', cd4_count)
+
+      self.create_observation_value_datetime(hiv_staging_encounter, 'Date of CD4 count', date_cd4_count)
+
+    end rescue nil
+
+    puts ">>>#{encounter_id} ############# Clinic consultation for #{patient_id}"
+
+    hiv_clinic_consultation_encounter = self.create_encounter(encounter_id, patient_id, HIV_clinic_consultation.id, visit_date, date_created)
+
+    visit_date = Utils.format_date(row[9]).to_date rescue nil
+
+    patient_disgnosis = @@patient_diagnosis[ref_id] rescue nil
+
+    if [1,2,3,4].include?tb_last_2_years.to_i
+
+      self.create_observation_value_coded(hiv_clinic_consultation_encounter, "TB Status", "TB suspected")
+
+    elsif tb_last_2_years.to_i == 0
+
+      self.create_observation_value_coded(hiv_clinic_consultation_encounter, "TB Status", "TB NOT suspected")
+
+    end
+
+    unless patient_disgnosis.blank?
+
+      (patient_disgnosis || []).each do |condition|
+
+        begin
+          
+          if condition.match(/cough/i) || condition.match(/fever/i) || condition.match(/malnutrition/i) || condition.match(/failure to thrive/i) || condition.match(/weight loss/i)
+
+            self.create_observation_value_coded(hiv_clinic_consultation_encounter, 'Routine TB screening',  condition)
+
+          else
+
+            self.create_observation_value_coded(hiv_clinic_consultation_encounter,'MALAWI ART SIDE EFFECTS', condition)
+
+          end
+
+        rescue
+
+        end
+
+      end
+
+    end
+
+    patient_tb = @@patient_tb_details[reference.to_i]
+
+    if !patient_tb.blank?
+
+      treatment_date_from = patient_tb['treatmentFrom']
+
+      treatment_date_to = patient_tb['treatmentTo']
+
+      patient_tb_type_code = patient_tb['FdnTbType']
+
+      puts "#{patient_id} >>>>>>>>>>>> #{treatment_date_from}>>>>>>>>>>>>>>#{treatment_date_to} >>>>>>> #{patient_tb_type_code}"
+
+      if visit_date.between?(treatment_date_to.to_date,treatment_date_from.to_date)
+
+        self.create_observation_value_coded(hiv_clinic_consultation_encounter, "TB status", "Confirmed TB on treatment")
+
+      else
+
+        if patient_tb_type_code == 99
+
+          self.create_observation_value_coded(hiv_clinic_consultation_encounter, "TB status", "Unknown")
+
+        else
+
+          self.create_observation_value_coded(hiv_clinic_consultation_encounter, "TB status", "TB suspected")
+
+        end
+
+      end
+
+    end
+
+    encounter_id = encounter_id + 1
+
+    if !amenorhea.blank?
+
+      self.create_observation_value_coded(hiv_clinic_consultation_encounter, 'Patient pregnant', 'Yes')
+
+    end
+
+    if diagnostic_2.match(/NEUROPATH/i) || diagnostic.match(/NEUROPATH/i)
+
+      self.create_observation_value_coded(hiv_clinic_consultation_encounter,'MALAWI ART SIDE EFFECTS', 'Peripheral neuropathy')
+
+    end rescue nil
+
+    if diagnostic_2.match(/anaemia/i) || diagnostic.match(/anaemia/i)
+
+      self.create_observation_value_coded(hiv_clinic_consultation_encounter, 'MALAWI ART SIDE EFFECTS', 'Anemia')
+
+    end rescue nil
+
+    if diagnostic_2.match(/jaundice/i) || diagnostic.match(/jaundice/i)
+
+      self.create_observation_value_coded(hiv_clinic_consultation_encounter,'MALAWI ART SIDE EFFECTS', 'Jaundice')
+
+    end rescue nil
+
+    if diagnostic_2.match(/psychosis/i) || diagnostic.match(/psychosis/i)
+
+      self.create_observation_value_coded(hiv_clinic_consultation_encounter, 'MALAWI ART SIDE EFFECTS','Psychosis')
+
+    end rescue nil
+
+    # >>>>>>>>>>>>>>>>>>> Associated symptoms <<<<<<<<<<<<<<<<<<<<< #
+    if diagnostic_2.match(/cough/i) || diagnostic.match(/cough/i)
+
+      self.create_observation_value_coded(hiv_clinic_consultation_encounter, 'Routine TB screening', 'Cough any duration')
+
+    end rescue nil
+
+    if diagnostic_2.match(/fever/i) || diagnostic.match(/fever/i)
+
+      self.create_observation_value_coded(hiv_clinic_consultation_encounter, 'Routine TB screening',  'Fever')
+
+    end rescue nil
+
+    if diagnostic_2.match(/malnutrition/i) || diagnostic.match(/malnutrition/i) || diagnostic_2(/failure to thrive/i) || diagnostic(/failure to thrive/i) || diagnostic_2(/weight loss/i) || diagnostic(/weight loss/i)
+
+      self.create_observation_value_coded(hiv_clinic_consultation_encounter, 'Routine TB screening',  'Weight loss / Failure to thrive / malnutrition')
+
+    end rescue nil
+
+    ##########################################################################################
+
+    medication_on_this_visit = @@drug_follow_up[ref_id] rescue nil
+
+    ############################ treatment and dispensation ##################################################
+
+    unless medication_on_this_visit.blank?
+
+      puts "#{encounter_id} ##################### Treatment for #{patient_id}"
+
+      treatment_encounter = self.create_encounter(encounter_id, patient_id, Treatment.id, visit_date, date_created)
+
+      reg = Regimen.find(:all,
+                         :conditions => ["#{weight_during_visit} >= FORMAT(min_weight,2)
+          and #{weight_during_visit} <= FORMAT(max_weight,2) and retired = 0"])
+
+      encounter_id = encounter_id + 1
+
+      puts "#{encounter_id} ##################### Dispensation for #{patient_id}"
+
+      dispensing_encounter = self.create_encounter(encounter_id, patient_id, Dispension.id, visit_date, date_created)
+
+      encounter_id = encounter_id + 1
+
+      (medication_on_this_visit || []).each do |medications, prescription|
+
+        (medications || []).each do |medication|
+
+          medication = "Aspirin (300mg tablet)" if medication.match(/Unknown/i)
+
+          drug = Drug.find_by_name(medication)
+
+          if next_visit.blank?
+
+            n_visit = (visit_date.to_date + 90.day).to_date
+
+          else
+
+            n_visit = next_visit
+
+          end
+
+          puts "#####{medication}"
+
+          begin
+            concept_id = drug.concept_id
+            drug_id = drug.drug_id
+          rescue
+            drug_attr = ActiveRecord::Base.connection.select_one <<EOF
+            select * from drug where name = "#{medication}";
+EOF
+
+            drug_id = drug_attr["drug_id"].to_i
+            concept_id = drug_attr["concept_id"]
+          end
+          continuity = Utils.get_drug_status(prescription)
+
+          puts "=+=+=+=+======++++++++++++++++++++===+====+++++++++++=====++++=++++++++++++=+=#{continuity}"
+
+          self.create_order(order_id, treatment_encounter, visit_date, n_visit, concept_id,continuity)
+
+          regimens = Regimen.find(:all, :conditions => ["#{weight_during_visit} >= FORMAT(min_weight,2) and #{weight_during_visit} <= FORMAT(max_weight,2)"])
+
+          regimen_drug_order = ""
+
+          regimens.each do |regimen|
+
+            regimen_drug_order = RegimenDrugOrder.find(:first, :conditions => ["regimen_id = #{regimen.regimen_id} AND drug_inventory_id = ?", drug_id])
+
+            if !regimen_drug_order.blank?
+
+              break
+
+            end
+
+          end
+
+          if regimen_drug_order.blank?
+
+            drug_frequency = "ONCE A DAY"
+
+            dose = "1.0"
+
+            units = "tab(s)"
+
+          else
+
+            drug_frequency = regimen_drug_order.frequency
+
+            dose = regimen_drug_order.dose
+
+            units = regimen_drug_order.units
+
+          end
+
+=begin
+      moh_regimen_doses = MohRegimenDoses.find(:first,
+        :joins =>"INNER JOIN moh_regimen_ingredient i ON i.dose_id = moh_regimen_doses.dose_id",
+        :conditions => ["drug_inventory_id = ? AND #{weight_during_visit.to_f} >= FORMAT(min_weight,2)
+      AND #{weight_during_visit.to_f} <= FORMAT(max_weight,2)", drug.id])
+=end
+
+          if dose.blank?
+
+            pills_per_day = 1.0
+
+          else
+
+            if drug_frequency.match(/ONCE A DAY/i) || drug_frequency.match(/IN THE EVENING/i) || drug_frequency.match(/IN THE MORNING/i)
+
+              pills_per_day = dose
+
+            elsif drug_frequency.match(/TWICE/i)
+
+              pills_per_day = dose.to_i * 2
+
+            end
+
+          end
+
+          duration = (n_visit - visit_date).to_i
+
+          quantity = (duration * pills_per_day.to_i)
+
+          #pill_given = DrugOrder.calculate_complete_pack(drug, quantity)
+
+          self.create_drug_order(order_id, drug_id, dose, pills_per_day, units, drug_frequency, quantity)
+
+          if medication == "Cotrimoxazole (960mg)"
+
+            self.create_observation_value_coded(dispensing_encounter,"Cotrimoxazole prophylaxis treatment started","Yes")
+
+          end
+
+          if medication == "INH or H (Isoniazid 100mg tablet)"
+
+            self.create_observation_value_coded(dispensing_encounter,"Isoniazid","Yes")
+
+          end
+
+          self.create_observation_value_drug(dispensing_encounter, "Amount dispensed", drug_id, quantity, order_id)
+
+          order_id = order_id + 1
+
+          # medication_pills_dispensed[drug.id] = pill_given
+
+
+        end
+
+=begin
+      if moh_regimen_doses.blank?
+        pills_per_day = 1.0
+      else
+        pills_per_day = (moh_regimen_doses.am.to_f + moh_regimen_doses.pm.to_f).to_f
+        puts "******************************* #{pills_per_day}"
+      end
+
+      duration = (visit_date - n_visit).to_i
+      units = (duration * pills_per_day)
+      pill_given = DrugOrder.calculate_complete_pack(drug, units)
+
+      medication_pills_dispensed[drug.id] = pill_given
+      #puts "............. #{medication_pills_dispensed[drug.id]}"
+=end
+
+      end
+
+    end
+
+    ##########################################################################################
+
+    ################################ set appointment #########################################
+
+    if !next_visit.blank?
+
+      puts ">>>#{encounter_id} ############# Appointment for: #{patient_id}"
+
+      appointment_encounter = self.create_encounter(encounter_id, patient_id, Appointment.id, visit_date, date_created)
+
+      encounter_id = encounter_id + 1
+
+      self.create_observation_value_datetime(appointment_encounter, "Appointment date", next_visit)
+
+    end
+
+    ##########################################################################################
+
+  end
+
+  puts "...............please wait............"
+
+  encounters_sql_file_path = "#{Destination_path}encounters.sql"
+  observation_sql_file_path  = "#{Destination_path}observations.sql"
+  order_sql_file_path = "#{Destination_path}orders.sql"
+  drug_order_sql_file_path = "#{Destination_path}drug_orders.sql"
+
+  Utilities.new.close_sql_with_semi_colon(encounters_sql_file_path)
+  Utilities.new.close_sql_with_semi_colon(observation_sql_file_path)
+  Utilities.new.close_sql_with_semi_colon(order_sql_file_path)
+  Utilities.new.close_sql_with_semi_colon(drug_order_sql_file_path)
+
+  puts "Loading encounters.............................."
+
+  `mysql -u '#{$db_user}' -p#{$db_pass} -h '#{$db_host}' '#{$source_db}' < '#{encounters_sql_file_path}' --verbose`
+
+  puts "Loading orders................................."
+
+  `mysql -u '#{$db_user}' -p#{$db_pass} -h '#{$db_host}' '#{$source_db}' < '#{order_sql_file_path}' --verbose`
+
+  puts "Loading drug orders............................."
+
+  `mysql -u '#{$db_user}' -p#{$db_pass} -h '#{$db_host}' '#{$source_db}' < '#{drug_order_sql_file_path}' --verbose`
+
+  puts "Loading observations............................"
+
+  `mysql -u '#{$db_user}' -p#{$db_pass} -h '#{$db_host}' '#{$source_db}' < '#{observation_sql_file_path}' --verbose`
+
+  puts "Data cleaning..................................."
+
+  DataCleaner.new.update_pregnancy_concept
+  DataCleaner.new.update_breastfeed_concept
+  DataCleaner.new.update_invalid_dates
+
+  puts "Script time: #{ScriptStared} - #{Time.now()}"
+
+end
+
+def get_initial_who_stage
+
+  FasterCSV.foreach("#{Source_path}/TbPatient.csv", :headers => true, :quote_char => '"', :col_sep => ',', :row_sep => :auto) do |row|
+
+    init_who = row['FdnWho']
+    patient_ref = row['FdxReference']
+
+    if @@initial_who_stage[patient_ref].blank?
+
+      @@initial_who_stage[patient_ref] = init_who
+
+    end
+
+  end
+
+end
+
+
+def get_patientTb_Status
+
+
+  FasterCSV.foreach("#{Source_path}/TbFollowUpTb.csv", :headers => true, :quote_char => '"', :col_sep => ',', :row_sep => :auto) do |row|
+
+    if @@patient_tb_details[row[3]].blank?
+
+      @@patient_tb_details[row[3]] = {}
+
+    end
+
+    treatment_from = Utils.format_date(row[5]) rescue nil
+
+    treatment_to = row[6].blank? ? treatment_from.to_date + 5.month : Utils.format_date(row[6])
+
+    tb_type_code  = row [12].to_i rescue nil
+
+    patient_id = row[3].to_i
+
+    puts "TB status for : #{patient_id}"
+
+    @@patient_tb_details[patient_id] = {'FdnTbType' => tb_type_code, 'treatmentFrom' => treatment_from,
+                                        'treatmentTo' => treatment_to}
+
+  end
+
+end
+
+#function that loads csv file data into a hash
+def get_references(parent_path, ref_id)
+
+  FasterCSV.foreach("#{parent_path}/TbReference.csv", :headers => true, :quote_char => '"', :col_sep =>',', :row_sep =>:auto) do |row|
+
+    if row[0].to_i.equal?(ref_id.to_i)
+
+      return row[6]
+
+    end
+
+  end
+
+end
+
+#function that patient_drug csv to a hash
+def get_patient_drug(parent_path, patient_id)
+
+  count = 0
+
+  drug_ref = Array.new
+
+  FasterCSV.foreach ("#{parent_path}TbPatientDrug.csv", :headers =>true, :quote_char => '"', :col_sep => ',', :row_sep =>:auto) do |row|
+
+    if row[3].to_i.equal?(patient_id.to_i)
+
+      drug_ref.insert(count,row[4])
+
+      count = count + 1
+
+    end
+
+  end
+
+  return drug_ref
+
+end
+
+
+def self.create_hiv_reception(enc_id, patient_id, visit_date, date_created)
+
+  encounter = self.create_encounter(enc_id, patient_id, Hiv_reception_encounter.id, visit_date, date_created)
+
+  if !encounter.blank?
+
+    self.create_observation_value_coded(encounter,  "Guardian present", "No")
+
+    self.create_observation_value_coded(encounter, "Patient present", "Yes")
+
+  end
+
+end
+
+def self.create_encounter(encounter_id, patient_id, encounter_type_id, visit_date, date_created)
+
+  if !patient_id.blank?
+
+    encounter = Encounter.new
+
+    encounter.id = encounter_id
+
+    encounter.encounter_type = encounter_type_id
+
+    encounter.patient_id = patient_id
+
+    encounter.encounter_datetime = visit_date.strftime("%Y-%m-%d 00:00:00")
+
+    uuid = ActiveRecord::Base.connection.select_one <<EOF
+     select uuid();
+EOF
+
+    visit_date =visit_date.strftime("%Y-%m-%d 00:00:00")
+
+    encounter.date_created = date_created
+
+    insert_encounters = "(\"#{encounter_id}\",\"#{encounter_type_id}\",\"#{patient_id}\",\"#{User.current.id}\",\"#{visit_date}\","
+    insert_encounters += "\"#{User.current.id}\",\"#{encounter.date_created.strftime("%Y-%m-%d 00:00:00")}\",\"#{uuid.values.first}\"),"
+
+    `echo -n '#{insert_encounters}' >> #{Destination_path}encounters.sql`
+
+
+  end
+
+  return encounter
+
+end
+
+def self.create_observation_value_numeric(encounter, concept_name, value)
+
+  concept_id = ConceptName.find_by_name(concept_name).concept_id
+
+  uuid = ActiveRecord::Base.connection.select_one <<EOF
+     select uuid();
+EOF
+
+  insert_observation = "(#{encounter.patient_id},#{encounter.id},#{concept_id},"
+  insert_observation += "\"#{value}\",NULL,NULL,NULL,NULL,\"#{encounter.encounter_datetime.strftime("%Y-%m-%d 00:00:00")}\","
+  insert_observation += "\"#{User.current.id}\",\"#{encounter.date_created.strftime("%Y-%m-%d 00:00:00")}\",\"#{uuid.values.first}\"),"
+
+  `echo -n '#{insert_observation}' >> #{Destination_path}observations.sql`
+end
+
+def self.create_observation_value_coded(encounter, concept_name, value_coded_concept_name)
+  concept_id = ConceptName.find_by_name(concept_name).concept_id
+  begin
+    value_coded = ConceptName.find_by_name(value_coded_concept_name).concept_id
+  rescue
+    File.open("#{Rails.root}/app/assets/data/errors/error.txt", 'a') do |f|
+      f.puts "#{value_coded_concept_name} \n"
+    end
+    puts "#{value_coded_concept_name}"
+    return
+  end
+
+  uuid =ActiveRecord::Base.connection.select_one <<EOF
+     select uuid();
+EOF
+  insert_observation_value_coded = "(#{encounter.patient_id},#{encounter.id},#{concept_id},NULL,"
+  insert_observation_value_coded += "\"#{value_coded}\",NULL,NULL,NULL,\"#{encounter.encounter_datetime.strftime("%Y-%m-%d 00:00:00")}\","
+  insert_observation_value_coded += "\"#{User.current.id}\",\"#{encounter.date_created.strftime("%Y-%m-%d 00:00:00")}\",\"#{uuid.values.first}\"),"
+
+  `echo -n '#{insert_observation_value_coded}' >> #{Destination_path}observations.sql`
+end
+
+def self.create_observation_value_datetime(encounter, concept_name, date)
+  concept_id = ConceptName.find_by_name(concept_name).concept_id
+
+  uuid =ActiveRecord::Base.connection.select_one <<EOF
+     select uuid();
+EOF
+  insert_observation_value_datetime = "(#{encounter.patient_id},#{encounter.id},#{concept_id},NULL,NULL,"
+  insert_observation_value_datetime += "\"#{date.strftime("%Y-%m-%d %H:%M:%S")}\",NULL,NULL,\"#{encounter.encounter_datetime.strftime("%Y-%m-%d 00:00:00")}\","
+  insert_observation_value_datetime += "\"#{User.current.id}\",\"#{encounter.date_created.strftime("%Y-%m-%d 00:00:00")}\",\"#{uuid.values.first}\"),"
+
+  `echo -n '#{insert_observation_value_datetime}' >> #{Destination_path}observations.sql`
+end
+
+def self.create_observation_value_drug(encounter, concept_name, value_drug, drug_amount, order_id)
+  concept_id = ConceptName.find_by_name(concept_name).concept_id
+
+  uuid =ActiveRecord::Base.connection.select_one <<EOF
+     select uuid();
+EOF
+  insert_observation_value_coded = "(#{encounter.patient_id},#{encounter.id},#{concept_id},#{drug_amount},"
+  insert_observation_value_coded += "NULL,NULL,#{value_drug},#{order_id},\"#{encounter.encounter_datetime.strftime("%Y-%m-%d 00:00:00")}\","
+  insert_observation_value_coded += "\"#{User.current.id}\",\"#{encounter.date_created.strftime("%Y-%m-%d 00:00:00")}\",\"#{uuid.values.first}\"),"
+
+  `echo -n '#{insert_observation_value_coded}' >> #{Destination_path}observations.sql`
+end
+
+def self.create_order(order_id, encounter, start_date, end_date, drug_id, discontinued)
+
+  uuid =ActiveRecord::Base.connection.select_one <<EOF
+      select uuid();
+EOF
+  insert_order = "(#{order_id},1,#{User.current.id},#{drug_id},#{encounter.id},\"#{start_date.strftime("%Y-%m-%d 00:00:00")}\","
+  insert_order += "\"#{end_date.strftime("%Y-%m-%d 00:00:00")}\",#{discontinued},#{User.current.id},"
+  insert_order += "\"#{encounter.encounter_datetime.strftime("%Y-%m-%d 00:00:00")}\",#{encounter.patient_id},\"#{uuid.values.first}\"),"
+
+  `echo -n '#{insert_order}' >> #{Destination_path}orders.sql`
+
+  return order_id
+end
+
+def self.create_drug_order(order_id, drug_id, dose, pills_per_day, units, drug_frequency, quantity)
+
+  insert_drug_order = "(#{order_id},#{drug_id},#{dose},#{pills_per_day},\"#{units}\",\"#{drug_frequency}\",#{quantity}),"
+
+  `echo -n '#{insert_drug_order}' >> #{Destination_path}drug_orders.sql`
+end
+
+def setup_staging_conditions
+
+  @@conditions_map = {"Weight loss >10%" => 'Severe weight loss >10% and/or BMI <18.5kg/m^2, unexplained',
+                      "Fever, unexplained" => 'Fever, persistent unexplained, intermittent or constant, >1 month',
+                      "In bed > 50 of normal daytime due to sickness" => 'Unknown',
+                      "Kaposi sarcoma" => 'Kaposi sarcoma',
+                      "Herpes zoster" => 'Herpes zoster',
+                      "Wasting syndrome by HIV/stunting/severe malnutrition" => 'HIV wasting syndrome (severe weight loss + persistent fever or severe weight loss + chronic diarrhoea)',
+                      "Minor mucocutaneous manifestations" => 'Minor mucocutaneous manifestations',
+                      "Weight loss <10%" => 'Moderate weight loss less than or equal to 10 percent, unexplained',
+                      "Pulmonary TB" => 'Pulmonary TB (current)',
+                      "URTI" => 'URTI',
+                      "Diarrhoea unexplained" => 'Diarrhoea, chronic (>1 month) unexplained',
+                      "Oral candidiasis" => 'Oral candidiasis',
+                      "Bacterial pneumonia, severe" => 'Bacterial pneumonia, severe recurrent',
+                      "Asymptomatic" => 'Asymptomatic',
+                      "Extrapulmonary and disseminated TB" => 'Extrapulmonary tuberculosis (EPTB)',
+                      "Bacterial infections, severe" => 'Bacterial infections, severe recurrent  (empyema, pyomyositis, meningitis, bone/joint infections but EXCLUDING pneumonia)',
+                      "Candidiasis oesophagus/trachea/bronchi /lungs" => 'Candidiasis of oseophagus',
+                      "Cryptococcosis extrapulmonary" => 'Cryptococcosis, extrapulmonary',
+                      "Vulvovaginal candidiasis > 1 month..." => 'Candidiasis vulvovaginal',
+                      "In bed < 50 of normal daytime due to sickness" => 'Unknown',
+                      "Oral hairy leukoplakia" => 'Oral hairy leukoplakia',
+                      "Herpes simplex infection" => 'Herpes simplex',
+                      "Encephalopathy by HIV" => 'Encephalopathy HIV',
+                      "Lymphoma cerebral or B non Hodgkin" => 'Lymphoma (cerebral or B-cell non hodgkin)',
+                      "Cytomegalovirus infection" => 'Cytomegalovirus infection',
+                      "Mycosis disseminated" => 'Disseminated mycosis (coccidiomycosis or histoplasmosis)',
+                      "Toxoplasmosis of the brain" => 'Toxoplasmosis of the brain',
+                      "Septicaemia recurrent" => 'Unknown',
+                      "HIV-associated nephropathy" => 'HIV associated nephropathy',
+                      "Pneumocystis pneumonia" => 'Pneumocystis pneumonia',
+                      "Angular cheilitis" => 'Angular cheilitis',
+                      "Isosporiasis" => 'Isosporiasis',
+                      "Seborrheic dermatitis" => 'Seborrhoeic dermatitis',
+                      "Wart infection" => 'Wart virus infection',
+                      "Papular pruritic eruption" => 'Papular pruritic eruptions',
+                      "Malnutrition moderate" => 'Malnutrition',
+                      "Progressive multifocal leukoencephalopathy" => 'Progressive multifocal leukoencephalopathy',
+                      "Unexplained anaemia/neutropenia/trombocytopenia" => 'Unexplained anaemia, neutropaenia, or throbocytopaenia',
+                      "Acute necrotizing ulcerative stomatitis" => ' Acute necrotizing ulcerative stomatitis, gingivitis or periodontitis',
+                      "Oral ulcerations" => 'Oral ulcerations, recurrent',
+                      "Persistent generalized lymphadenopathy" => 'Persistent generalized lymphadenopathy'
+  }
+
+  conditions = []
+
+  FasterCSV.foreach("#{Source_path}TbFollowUpDiagnosis.csv", :headers => true, :quote_char => '"', :col_sep => ',', :row_sep => :auto) do |row|
+    conditions << row[4].to_i
+    conditions = conditions.uniq
+  end
+
+  FasterCSV.foreach("#{Source_path}TbPatientDiagnosis.csv", :headers => true, :quote_char => '"', :col_sep => ',', :row_sep => :auto) do |row|
+    patient_reference = row[3].to_i
+
+    if @@patient_visits[patient_reference].blank?
+      @@patient_visits[patient_reference] = []
+    end
+    @@patient_visits[patient_reference] << @@conditions_map[@@references[row[4].to_i]]
+    @@patient_visits[patient_reference] = @@patient_visits[patient_reference].uniq
+  end
+end
+
+# just added #
+
+def setup_diagnosis
+
+  FasterCSV.foreach("#{Source_path}TbFollowUpDiagnosis.csv", :headers => true, :quote_char => '"', :col_sep => ',', :row_sep => :auto) do |row|
+    follow_up_reference = row[3].to_i
+
+    if @@patient_diagnosis[follow_up_reference].blank?
+      @@patient_diagnosis[follow_up_reference] = []
+    end
+    @@patient_diagnosis[follow_up_reference] << @@conditions_map[@@references[row[4].to_i]]
+    @@patient_diagnosis[follow_up_reference] = @@patient_diagnosis[follow_up_reference].uniq
+  end
+
+end
+
+# end #
+
+def drug_mapping
+  @@drug_map = {
+      "Cotrimoxazole prophylaxis" => ['Cotrimoxazole (960mg)'],
+      "FDC3 (AZT-3TC-NVP)" => ['AZT/3TC (Zidovudine and Lamivudine 300/150mg)'],
+      "Efavirenz 600" => ['EFV (Efavirenz 600mg tablet)'],
+      "Isoniazide prophylaxis" => ['INH or H (Isoniazid 100mg tablet)'],
+      "FDC11 (TDF-3TC-EFV)" => ['TDF/3TC/EFV (300/300/600mg tablet)'],
+      "FDC1 (D4T30-3TC-NVP)" => ['d4T/3TC (Stavudine Lamivudine 30/150 tablet)','NVP (Nevirapine 200 mg tablet)'],
+      "Lamivudine" => ['3TC (Lamivudine 150mg tablet)'],
+      "Stavudine (dosage unspecified)" => ['d4T (Stavudine 30mg tablet)'],
+      "Nevirapine" => ['NVP (Nevirapine 200 mg tablet)'],
+      "FDC2 pediatric (AZT-3TC-NVPp)" => ['AZT/3TC/NVP (60/30/50mg tablet)'],
+      "FDC10 (TDF-3TC)" => ['TDF/3TC (Tenofavir and Lamivudine 300/300mg tablet'],
+      "Atazanavir/Ritonavir" => ['ATV/r (Atazanavir 300mg/Ritonavir 100mg)'],
+      "FDC2 (D4T40-3TC-NVP)" => ['Triomune-40'],
+      "FDC5 (D4T30-3TC)" => ['Triomune-30'],
+      "Dapsone prophylaxis" => ['Dapsone (100mg tablet)'],
+      "Kaletra (Lopinavir/Ritonavir) pediatric" => ['LPV/r (Lopinavir and Ritonavir 100/25mg tablet)'],
+      "FDC5 pediatric (ABC-3TCp)" => ['ABC/3TC (Abacavir and Lamivudine 60/30mg tablet)'],
+      "FDC7 (AZT-3TC)" => ['AZT/3TC (Zidovudine and Lamivudine 300/150mg)'],
+      "Fluconazole secondary prophylaxis" => ['Fluconazole (200mg tablet)'],
+      "FDC4 pediatric (AZT-3TCp)" => ['AZT/3TC (Zidovudine and Lamivudine 60/30 tablet)'],
+      "Stavudine 30" => ['d4T (Stavudine 30mg tablet)'],
+      "FDC1 pediatric (D4T30-3TC-NVPp)" => ['Triomune baby (d4T/3TC/NVP 6/30/50mg tablet)'],
+      "Kaletra (Lopinavir/Ritonavir)" => ['LPV/r (Lopinavir and Ritonavir 200/50mg tablet)'],
+      "Efavirenz pediatric" =>['EFV (Efavirenz 50mg tablet)'],
+      "Nevirapine pediatric" => ['NVP (Nevirapine 50 mg tablet)'],
+      "Lamivudine pediatric" => ['3TC (Lamivudine syrup 10mg/mL from 100mL bottle)'],
+      "Abacavir pediatric" => ['Unknown'],
+      "Ritonavir" => ['Ritonavir 100mg'],
+      "Darunavir" => ['Darunavir 600mg'],
+      "Raltegravir" => ['RAL (Raltegravir 400mg)'],
+      "Abacavir" => ['ABC (Abacavir 300mg tablet)'],
+      "Fluconazole primary prophylaxis" => ['FCZ (Fluconazole 150mg tablet)'],
+      "Tenofovir" => ['TDF (Tenofavir 300 mg tablet)'],
+      "FDC3 pediatric (D4T30-3TCp)" =>  ['d4T/3TC (Stavudine Lamivudine 30/150 tablet)'],
+      "Zidovudine" => ['AZT (Zidovudine 300mg tablet)'],
+      "FDC12 (TDF-3TC-NVP)" => ['TDF/3TC (Tenofavir and Lamivudine 300/300mg tablet'],
+      "Nelfinavir" => ['NFV(Nelfinavir)'],
+      "Didanosine 250" => ['DDI (Didanosine 125mg tablet)'],
+      "Zidovudine (Mother to child)" => ['AZT (Zidovudine 300mg tablet)'],
+      "Nevirapine (Mother to child)" => ['NVP (Nevirapine 200 mg tablet)'],
+      "Didanosine 400" => ['DDI (Didanosine 200mg tablet)'],
+      "Other ARV 2" => ['Unknown'],
+      "Zidovudine pediatric" => ['AZT (Zidovudine 100mg tablet)'],
+      "FDC6 (D4T40-3TC)" => ['d4T/3TC (Stavudine Lamivudine 30/150 tablet)'],
+      "Other ARV 1" => ['Unknown'],
+      "Stavudine pediatric" => ['d4T (Stavudine 30mg tablet)'],
+      "Stavudine 40" => ['d4T (Stavudine 40mg tablet)'],
+      "Nelfinavir pediatric" => ['NFV(Nelfinavir)'],
+      "Efavirenz 800" => ['EFV (Efavirenz 600mg tablet)'],
+      "Atazanavir" => ['ATV/(Atazanavir)'],
+      "NVP Single Dose + (AZT-3TC) regimen (Mother to child)" => ['AZT/3TC (Zidovudine and Lamivudine 300/150mg)','NVP (Nevirapine 200 mg tablet)']
+  }
+
+  FasterCSV.foreach("#{Source_path}TbFollowUpDrug.csv", :headers => true, :quote_char => '"', :col_sep => ',', :row_sep => :auto) do |row|
+    follow_up_ref = row[3].to_i
+    visit_date = Utils.format_date(row[1]).to_date rescue nil
+    next if visit_date.blank?
+
+    if @@drug_follow_up[follow_up_ref].blank?
+      @@drug_follow_up[follow_up_ref] = []
+    end
+    @@drug_follow_up[follow_up_ref] << @@drug_map[@@references[row[4].to_i]]
+    @@drug_follow_up[follow_up_ref] = @@drug_follow_up[follow_up_ref].uniq
+    puts "Mapping medication: #{@@drug_map[@@references[row[4].to_i]]} ...."
+  end
+
+end
+get_initial_who_stage
+get_patientTb_Status
+setup_staging_conditions
+setup_diagnosis
+start

@@ -50,6 +50,7 @@ def start
 
     patient_program = PatientProgram.create(:patient_id => patient_id,
                                             :program_id => @@program.id, :date_enrolled => initiation_date)
+    next if patient_program.blank?
     last_state = PatientState.create(:patient_program_id => patient_program.id, :state => 1, :start_date => initiation_date)
 
     puts "Update outcome to Pre ART: #{patient_id}  #{initiation_date}"

@@ -46,60 +46,56 @@ def start
       outcome_date = Date.today
     end
 
+    begin
 
+      patient_program = PatientProgram.create(:patient_id => patient_id,
+                                              :program_id => @@program.id, :date_enrolled => initiation_date)
+      next if patient_program.blank?
+      last_state = PatientState.create(:patient_program_id => patient_program.id, :state => 1, :start_date => initiation_date)
 
-    patient_program = PatientProgram.create(:patient_id => patient_id,
-                                            :program_id => @@program.id, :date_enrolled => initiation_date)
-    next if patient_program.blank?
-    last_state = PatientState.create(:patient_program_id => patient_program.id, :state => 1, :start_date => initiation_date)
+      puts "Update outcome to Pre ART: #{patient_id}  #{initiation_date}"
 
-    puts "Update outcome to Pre ART: #{patient_id}  #{initiation_date}"
+      arv_dispensed, arv_start_date = Utils.has_arv_dispensed(patient_id)
 
-    arv_dispensed, arv_start_date = Utils.has_arv_dispensed(patient_id)
+      if arv_dispensed == true
 
-    if arv_dispensed == true
+        last_state.update_attributes(:end_date => initiation_date)
+        puts "Update outcome to On ART: #{patient_id}  #{initiation_date}"
+        last_state = PatientState.create(:patient_program_id => patient_program.id, :state => 7, :start_date => initiation_date)
 
-      last_state.update_attributes(:end_date => initiation_date)
-      puts "Update outcome to On ART: #{patient_id}  #{initiation_date}"
-      last_state = PatientState.create(:patient_program_id => patient_program.id, :state => 7, :start_date => initiation_date)
+      end
 
+      unless patient_died.blank?
+
+        last_state.update_attributes(:end_date => outcome_date)
+        last_state = PatientState.create(:patient_program_id => patient_program.id, :state => 3,
+                                         :start_date => outcome_date, :end_date => outcome_date)
+
+        puts "Update outcome to dead: #{patient_id}  #{outcome_date}"
+
+      end
+
+      if primary_outcome == "TO"
+
+        last_state.update_attributes(:end_date => outcome_date)
+        last_state = PatientState.create(:patient_program_id => patient_program.id, :state => 2,
+                                         :start_date => outcome_date, :end_date => outcome_date)
+        puts "Update outcome to Transfered Out: #{patient_id}  #{outcome_date}"
+      end
+
+      if primary_outcome == "Stop"
+
+        last_state.update_attributes(:end_date => outcome_date)
+        last_state = PatientState.create(:patient_program_id => patient_program.id, :state => 6,
+                                         :start_date => outcome_date, :end_date => outcome_date)
+        puts "Update outcome to Stop ARV: #{patient_id}  #{outcome_date}"
+
+      end
+
+    rescue
+      # log errors
     end
 
-    unless patient_died.blank?
-
-      last_state.update_attributes(:end_date => outcome_date)
-      last_state = PatientState.create(:patient_program_id => patient_program.id, :state => 3,
-                                       :start_date => outcome_date, :end_date => outcome_date)
-
-      puts "Update outcome to dead: #{patient_id}  #{outcome_date}"
-
-    end
-
-    if primary_outcome == "TO"
-
-      last_state.update_attributes(:end_date => outcome_date)
-      last_state = PatientState.create(:patient_program_id => patient_program.id, :state => 2,
-                                       :start_date => outcome_date, :end_date => outcome_date)
-      puts "Update outcome to Transfered Out: #{patient_id}  #{outcome_date}"
-    end
-
-    if primary_outcome == "Stop"
-
-      last_state.update_attributes(:end_date => outcome_date)
-      last_state = PatientState.create(:patient_program_id => patient_program.id, :state => 6,
-                                       :start_date => outcome_date, :end_date => outcome_date)
-      puts "Update outcome to Stop ARV: #{patient_id}  #{outcome_date}"
-
-    end
-
-    # dispense_encounter = Encounter.find(:first,
-    #                                    :conditions => ["patient_id = ? and encounter_type = ? and encounter_datetime = ?",
-    #                                    patient_id,Dispensing.id,date])
-    #
-    # unless dispense_encounter.blank?
-    #   puts ">>>>>>>>>>>>>>>#{@counter}>>>#{dispense_encounter.encounter_datetime}"
-    #   @counter = @counter + 1
-    # end
 
   end
 

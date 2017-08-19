@@ -56,71 +56,63 @@ def start
 
     next if patient_id.blank?
 
-    staging_encounter = Encounter.find(:first, :conditions => ["patient_id = ? and encounter_type = ?",
-    patient_id, HIV_STAGING.id])
+    begin
 
-    consultation_encounter = Encounter.find(:last, :conditions => ["patient_id = ? and encounter_type = ?",
+      staging_encounter = Encounter.find(:first, :conditions => ["patient_id = ? and encounter_type = ?",
+                                                                 patient_id, HIV_STAGING.id])
+
+      consultation_encounter = Encounter.find(:last, :conditions => ["patient_id = ? and encounter_type = ?",
                                                                      patient_id, HIV_CLINIC_CONSULT.id])
 
-    if staging_encounter.blank?
-      staging_encounter = Encounter.create(:encounter_type => HIV_STAGING.id, :patient_id => patient_id,
-                                                  :encounter_datetime => date)
-    else
-      staging_encounter.update_attributes(:encounter_datetime => date)
-    end
+      if staging_encounter.blank?
+        staging_encounter = Encounter.create(:encounter_type => HIV_STAGING.id, :patient_id => patient_id,
+                                             :encounter_datetime => date)
+      else
+        staging_encounter.update_attributes(:encounter_datetime => date)
+      end
 
-    ############## patient is pregnant on the initiation #######################
+      ############## patient is pregnant on the initiation #######################
 
-    if gender == "FP"
+      if gender == "FP"
         puts "Patient #{patient_id} pregnant on initiation"
         Observation.create(:person_id => patient_id, :concept_id => Preg_at_initiation_concept_id, :encounter_id => staging_encounter.id,
                            :obs_datetime => date, :value_coded => Yes, :creator => User.current.id)
-    end
-
-    ##################### tb status on initiation ###################################
-
-    unless tb_status.blank?
-      if tb_status == "Last 2yrs"
-        puts "Patient #{patient_id} had TB within the last 2 years on initiation"
-        eptb_concept = Ptb_within_the_past_two_yrs_concept_id
-      elsif tb_status == "Curr"
-        puts "Patient #{patient_id} had TB on initiation"
-        eptb_concept = Eptb_concept_id
       end
 
-      Observation.create(:person_id => patient_id, :concept_id => Who_stages_criteria, :encounter_id => staging_encounter.id,
-                         :obs_datetime => date, :value_coded => eptb_concept, :creator => User.current.id)
-    end
+      ##################### tb status on initiation ###################################
 
-    ##################### current tb/pregnant status ###################################
+      unless tb_status.blank?
+        if tb_status == "Last 2yrs"
+          puts "Patient #{patient_id} had TB within the last 2 years on initiation"
+          eptb_concept = Ptb_within_the_past_two_yrs_concept_id
+        elsif tb_status == "Curr"
+          puts "Patient #{patient_id} had TB on initiation"
+          eptb_concept = Eptb_concept_id
+        end
 
-    unless consultation_encounter.blank?
-
-      if cur_preg == "1"
-
-        puts "Patient currently pregnant"
-        Observation.create(:person_id => patient_id, :concept_id => ConceptName.find_by_name("Is patient pregnant?").concept_id,
-                           :encounter_id => consultation_encounter.id, :obs_datetime => consultation_encounter.encounter_datetime,
-                           :value_coded => Yes, :creator => User.current.id)
+        Observation.create(:person_id => patient_id, :concept_id => Who_stages_criteria, :encounter_id => staging_encounter.id,
+                           :obs_datetime => date, :value_coded => eptb_concept, :creator => User.current.id)
       end
 
-    end
+      ##################### current tb/pregnant status ###################################
 
-=begin
-      if cur_tb_status == "1"
-        puts "Patient current TB Status Suspected"
-        Observation.create(:person_id => patient_id, :concept_id => ConceptName.find_by_name("TB status").concept_id,
-                           :encounter_id => consultation_encounter.id, :obs_datetime => consultation_encounter.encounter_datetime,
-                           :value_coded => ConceptName.find_by_name("TB suspected").concept_id, :creator => User.current.id)
-      elsif cur_tb_status == "0"
-        puts "Patient current TB Status Not Suspected"
-        Observation.create(:person_id => patient_id, :concept_id => ConceptName.find_by_name("TB status").concept_id,
-                           :encounter_id => consultation_encounter.id, :obs_datetime => consultation_encounter.encounter_datetime,
-                           :value_coded => ConceptName.find_by_name("TB NOT suspected").concept_id, :creator => User.current.id)
+      unless consultation_encounter.blank?
+
+        if cur_preg == "1"
+
+          puts "Patient currently pregnant"
+          Observation.create(:person_id => patient_id, :concept_id => ConceptName.find_by_name("Is patient pregnant?").concept_id,
+                             :encounter_id => consultation_encounter.id, :obs_datetime => consultation_encounter.encounter_datetime,
+                             :value_coded => Yes, :creator => User.current.id)
+        end
+
       end
 
+    rescue
+
+      # log errors
+
     end
-=end
 
   end
 

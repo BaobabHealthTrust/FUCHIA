@@ -39,13 +39,15 @@ def start
     month_of_death = row["Month of Death after ARV start"]
     primary_outcome = row["Other Primary Outcomes"]
     outcome_date = row["Outcome Date"]
-    start_date = row["Date of ARV Initiation"]
+    start_date = row["Date of ARV Initiation"] rescue nil
     last_arv_treatment = row["Last ARV Treatment"]
     moh_regimen = row["MOH Regimen"]
     cur_preg = row["Current Preg Status"]
     cur_tb_status = row["Current TB Status"]
     side_effect = row["Side Effects"]
     adherence = row["Adherence (Pills Remaining)"]
+
+    next if start_date.blank?
 
     day = start_date.split("-")[0]
     month = Date::ABBR_MONTHNAMES.index(start_date.split("-")[1])

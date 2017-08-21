@@ -25,12 +25,13 @@ def start
   FasterCSV.foreach(@@table, :headers => true, :quote_char => '"', :col_sep => ',', :row_sep => :auto) do |row|
 
 
-      start_date = row["Date of ARV Initiation"]
+      start_date = row["Date of ARV Initiation"] rescue nil
       identifier = row["FUCHIA ID"]
       patient_died = row["Month of Death after ARV start"]
       primary_outcome = row["Other Primary Outcomes"]
       patient_id = PatientIdentifier.find_by_identifier(identifier).patient_id rescue nil
-      next if patient_id.blank?
+      next if patient_id.blank? || start_date.blank?
+      
       day = start_date.split("-")[0]
       month = Date::ABBR_MONTHNAMES.index(start_date.split("-")[1])
       year = start_date.split("-")[2]
